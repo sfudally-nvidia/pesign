@@ -347,6 +347,7 @@ check_cert(pesigcheck_context *ctx, SECItem *sig, efi_guid_t *sigtype,
 {
 	SEC_PKCS7ContentInfo *cinfo = NULL;
 	CERTCertificate *cert = NULL;
+	CERTCertificate **certs = NULL;
 	CERTCertTrust trust;
 	SECItem *content, *digest = NULL;
 	PK11Context *pk11ctx = NULL;
@@ -358,6 +359,10 @@ check_cert(pesigcheck_context *ctx, SECItem *sig, efi_guid_t *sigtype,
 	SECItem *eTime;
 	PRTime earlyNow = 0, lateNow = 0x7fffffffffffffff;
 	PRTime notBefore, notAfter;
+	CERTCertDBHandle *certdb;
+	SEC_PKCS7SignedData *sdp;
+	SECItem **rawcerts;
+	int certcount = 0;
 
 	efi_guid_t efi_x509 = efi_guid_x509_cert;
 
@@ -397,6 +402,42 @@ check_cert(pesigcheck_context *ctx, SECItem *sig, efi_guid_t *sigtype,
 				    NULL, NULL);
 	if (!cinfo)
 		goto out;
+
+	/* Import all certificates from the PKCS7 signature into the NSS database
+	 * so that chain validation can work properly. Also mark CA certificates
+	 * as valid for chain building. */
+	if (cinfo->contentTypeTag->offset == SEC_OID_PKCS7_SIGNED_DATA) {
+		sdp = cinfo->content.signedData;
+		rawcerts = sdp->rawCerts;
+		certdb = CERT_GetDefaultCertDB();
+
+		if (certdb != NULL && rawcerts != NULL) {
+			certcount = 0;
+			for (; rawcerts[certcount] != NULL; certcount++)
+				;
+			if (certcount > 0) {
+				rv = CERT_ImportCerts(certdb, certUsageObjectSigner,
+						      certcount, rawcerts, &certs,
+						      PR_FALSE, PR_FALSE, NULL);
+				if (rv != SECSuccess) {
+					/* Non-fatal: continue anyway */
+					certs = NULL;
+				} else {
+					/* Mark CA certificates as trusted for cert chain verification.
+					 * This allows intermediate CAs in the chain to be used. */
+					for (int i = 0; i < certcount; i++) {
+						if (certs[i] && CERT_IsCACert(certs[i], NULL)) {
+							CERTCertTrust ca_trust;
+							rv = CERT_DecodeTrustString(&ca_trust, "C,C,C");
+							if (rv == SECSuccess) {
+								CERT_ChangeCertTrust(certdb, certs[i], &ca_trust);
+							}
+						}
+					}
+				}
+			}
+		}
+	}
 
 	/* Generate the digest of contentInfo */
 	/* XXX support only sha256 for now */
@@ -454,6 +495,8 @@ check_cert(pesigcheck_context *ctx, SECItem *sig, efi_guid_t *sigtype,
 
 	status = FOUND;
 out:
+	if (certs)
+		CERT_DestroyCertArray(certs, certcount);
 	if (cinfo)
 		SEC_PKCS7DestroyContentInfo(cinfo);
 	if (cert)

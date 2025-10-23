@@ -67,7 +67,8 @@ generate_certificate_list(cms_context *cms, SECItem ***certificate_list_p)
 	SECItem **certificates = NULL;
 	void *mark = PORT_ArenaMark(cms->arena);
 
-	certificates = PORT_ArenaZAlloc(cms->arena, sizeof (SECItem *) * 3);
+	/* Allocate space for a reasonable certificate chain (up to 10 certs) */
+	certificates = PORT_ArenaZAlloc(cms->arena, sizeof (SECItem *) * 11);
 	if (!certificates) {
 		save_port_err() {
 			PORT_ArenaRelease(cms->arena, mark);
@@ -76,6 +77,7 @@ generate_certificate_list(cms_context *cms, SECItem ***certificate_list_p)
 	}
 	int i = 0;
 
+	/* Add the signing certificate first */
 	certificates[i] = PORT_ArenaZAlloc(cms->arena, sizeof (SECItem));
 	if (!certificates[i]) {
 		save_port_err() {
@@ -85,31 +87,53 @@ generate_certificate_list(cms_context *cms, SECItem ***certificate_list_p)
 	}
 	SECITEM_CopyItem(cms->arena, certificates[i++], &cms->cert->derCert);
 
-	if (!is_issuer_of(cms->cert, cms->cert)) {
-		CERTCertificate *signer = NULL;
-		int rc = find_named_certificate(cms, cms->cert->issuerName,
-						&signer);
-		if (rc == 0 && signer &&
-				signer->derCert.len && signer->derCert.data) {
-			if (signer->derCert.len != cms->cert->derCert.len ||
-					memcmp(signer->derCert.data,
-						cms->cert->derCert.data,
-						signer->derCert.len)) {
-				certificates[i] = PORT_ArenaZAlloc(cms->arena,
-							sizeof (SECItem));
-				if (!certificates[i]) {
-					save_port_err() {
-						PORT_ArenaRelease(cms->arena, mark);
-					}
-					cmsreterr(-1, cms,"could not allocate "
-						"certificate entry");
+	/* Build the complete certificate chain by walking up to the root CA */
+	CERTCertificate *current_cert = cms->cert;
+	CERTCertificate *issuer_cert = NULL;
+	int chain_depth = 0;
+	const int max_chain_depth = 9; /* Prevent infinite loops */
+
+	while (!is_issuer_of(current_cert, current_cert) && chain_depth < max_chain_depth) {
+		int rc = find_named_certificate(cms, current_cert->issuerName,
+						&issuer_cert);
+		if (rc != 0 || !issuer_cert ||
+		    !issuer_cert->derCert.len || !issuer_cert->derCert.data) {
+			/* Issuer not found in NSS database, stop here */
+			if (issuer_cert)
+				CERT_DestroyCertificate(issuer_cert);
+			break;
+		}
+
+		/* Check if this issuer is different from the current cert (avoid duplicates) */
+		if (issuer_cert->derCert.len != current_cert->derCert.len ||
+		    memcmp(issuer_cert->derCert.data, current_cert->derCert.data,
+		           issuer_cert->derCert.len) != 0) {
+			/* Add issuer to the certificate list */
+			certificates[i] = PORT_ArenaZAlloc(cms->arena, sizeof (SECItem));
+			if (!certificates[i]) {
+				save_port_err() {
+					CERT_DestroyCertificate(issuer_cert);
+					PORT_ArenaRelease(cms->arena, mark);
 				}
-				SECITEM_CopyItem(cms->arena, certificates[i++],
-						&signer->derCert);
+				cmsreterr(-1, cms, "could not allocate certificate entry");
 			}
-			CERT_DestroyCertificate(signer);
+			SECITEM_CopyItem(cms->arena, certificates[i++], &issuer_cert->derCert);
+
+			/* Move up the chain */
+			if (current_cert != cms->cert)
+				CERT_DestroyCertificate(current_cert);
+			current_cert = issuer_cert;
+			chain_depth++;
+		} else {
+			/* Same certificate, we've reached the end */
+			CERT_DestroyCertificate(issuer_cert);
+			break;
 		}
 	}
+
+	/* Clean up if we kept a reference to an issuer cert */
+	if (current_cert != cms->cert && current_cert != NULL)
+		CERT_DestroyCertificate(current_cert);
 
 	*certificate_list_p = certificates;
 	PORT_ArenaUnmark(cms->arena, mark);
